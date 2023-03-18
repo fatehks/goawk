@@ -11,15 +11,47 @@ import (
 	. "github.com/benhoyt/goawk/lexer"
 )
 
+/*
+Why is the scope of "x" shown as Special below:
+
+$ go run . -dt -da 'BEGIN { a[1]=1; a[2]=2; a[3]=3; print len(a) } function len(x) { return length(x) }'
+scalars: map[]
+arrays: map[ARGV:2 ENVIRON:3 FIELDS:0 a:1]
+globals
+  ARGV: typ=Array ref=0x0 scope=Global index=2 callName="" argIndex=0
+  ENVIRON: typ=Array ref=0x0 scope=Global index=3 callName="" argIndex=0
+  FIELDS: typ=Array ref=0x0 scope=Global index=0 callName="" argIndex=0
+  a: typ=Array ref=0x0 scope=Global index=1 callName="" argIndex=0
+function len
+  x: typ=Array ref=0x0 scope=Special index=0 callName="" argIndex=0
+        // BEGIN
+0000    Num 1 (0)
+0002    Str "1" (0)
+0004    AssignArrayGlobal a
+0006    Num 2 (1)
+0008    Str "2" (1)
+000a    AssignArrayGlobal a
+000c    Num 3 (2)
+000e    Str "3" (2)
+0010    AssignArrayGlobal a
+0012    CallUser len [a]
+0017    Print 1
+
+        // function len
+0000    CallLengthArray x
+0003    Return
+*/
+
 type resolver struct {
 	// Resolving state
 	funcName string // function name if parsing a func, else ""
 
 	// Variable tracking and resolving
-	locals    map[string]bool                // current function's locals (for determining scope)
-	varTypes  map[string]map[string]typeInfo // map of func name to var name to type
-	varRefs   []varRef                       // all variable references (usually scalars)
-	arrayRefs []arrayRef                     // all array references
+	locals         map[string]bool                // current function's locals (for determining scope)
+	varTypes       map[string]map[string]typeInfo // map of func name to var name to type
+	varRefs        []varRef                       // all variable references (usually scalars)
+	arrayRefs      []arrayRef                     // all array references
+	lengthVarCalls []lengthVarCall
 
 	// Function tracking
 	functions   map[string]int // map of function name to index
@@ -56,6 +88,12 @@ func Resolve(prog *ast.Program, config *Config) *ast.ResolvedProgram {
 	return resolvedProg
 }
 
+type lengthVarCall struct {
+	funcName string
+	pArg     *ast.Expr
+	scope    ast.VarScope
+}
+
 func (r *resolver) Visit(node ast.Node) ast.Visitor {
 	switch n := node.(type) {
 
@@ -84,6 +122,23 @@ func (r *resolver) Visit(node ast.Node) ast.Visitor {
 	case *ast.ArrayExpr:
 		r.recordArrayRef(n)
 
+	case *ast.CallExpr:
+		if n.Func == F_LENGTH && len(n.Args) == 1 {
+			if varExpr, ok := n.Args[0].(*ast.VarExpr); ok {
+				// It's length(x), not sure if x is scalar or array here
+				// TODO: record length(x) call: funcName, varName, and scope
+				scope, funcName := r.getScope(varExpr.Name)
+				//fmt.Printf("TODO first pass length(%s) scope=%d\n", n.Args[0], scope)
+				r.lengthVarCalls = append(r.lengthVarCalls, lengthVarCall{
+					funcName: funcName,
+					pArg:     &n.Args[0],
+					scope:    scope,
+				})
+				return nil
+			}
+		}
+		return r
+
 	case *ast.UserCallExpr:
 		name := n.Name
 		if r.locals[name] {
@@ -94,12 +149,53 @@ func (r *resolver) Visit(node ast.Node) ast.Visitor {
 			r.processUserCallArg(name, arg, i)
 		}
 		r.userCalls = append(r.userCalls, userCall{n, n.Pos, r.funcName})
+
 	default:
 		return r
 	}
 
 	return nil
 }
+
+//type lengthCallResolver struct {
+//	resolver *resolver
+//	funcName string
+//}
+//
+//func (lcr *lengthCallResolver) Visit(node ast.Node) ast.Visitor {
+//	switch n := node.(type) {
+//	case *ast.Function:
+//		lcr.funcName = n.Name
+//		ast.WalkStmtList(lcr, n.Body)
+//		lcr.funcName = ""
+//
+//	case *ast.CallExpr:
+//		if n.Func == F_LENGTH && len(n.Args) == 1 {
+//			if varExpr, ok := n.Args[0].(*ast.VarExpr); ok {
+//				// It's length(x), we should now know the type
+//				argType := lcr.resolver.varTypes[lcr.funcName][varExpr.Name]
+//				fmt.Printf("TODO second pass funcName=%q, name=%q, argType=%+v\n",
+//					lcr.funcName, varExpr.Name, argType)
+//				if argType.typ == typeArray {
+//					fmt.Printf("TODO second pass length(%s) -- array\n", n.Args[0])
+//					// Replace VarExpr with ArrayExpr
+//					arrayExpr := ast.ArrayRef(varExpr.Name, varExpr.Pos)
+//					n.Args[0] = arrayExpr
+//					lcr.resolver.recordArrayRef2(arrayExpr, lcr.funcName, argType.scope)
+//				} else {
+//					fmt.Printf("TODO second pass length(%s) -- scalar\n", n.Args[0])
+//					lcr.resolver.recordVarRef2(varExpr, lcr.funcName, argType.scope)
+//				}
+//				return nil
+//			}
+//		}
+//		return lcr
+//
+//	default:
+//		return lcr
+//	}
+//	return nil
+//}
 
 type varType int
 
@@ -231,6 +327,7 @@ func (r *resolver) processUserCallArg(funcName string, arg ast.Expr, index int) 
 		if ref == varExpr {
 			// Only applies if this is the first reference to this
 			// variable (otherwise we know the type already)
+			//fmt.Printf("TODO typeInfo 0 scope=%d\n", scope)
 			r.varTypes[varFuncName][varExpr.Name] = typeInfo{typeUnknown, ref, scope, 0, funcName, index}
 		}
 		// Mark the last related varRef (the most recent one) as a
@@ -261,6 +358,18 @@ func (r *resolver) recordVarRef(expr *ast.VarExpr) {
 	r.varRefs = append(r.varRefs, varRef{funcName, expr, false})
 	info := r.varTypes[funcName][name]
 	if info.typ == typeUnknown {
+		//fmt.Printf("TODO typeInfo 1 scope=%d\n", scope)
+		r.varTypes[funcName][name] = typeInfo{typeScalar, expr, scope, 0, info.callName, 0}
+	}
+}
+
+func (r *resolver) recordVarRef2(expr *ast.VarExpr, funcName string, scope ast.VarScope) {
+	name := expr.Name
+	expr.Scope = scope
+	r.varRefs = append(r.varRefs, varRef{funcName, expr, false})
+	info := r.varTypes[funcName][name]
+	if info.typ == typeUnknown {
+		//fmt.Printf("TODO typeInfo 2 scope=%d\n", scope)
 		r.varTypes[funcName][name] = typeInfo{typeScalar, expr, scope, 0, info.callName, 0}
 	}
 }
@@ -277,6 +386,22 @@ func (r *resolver) recordArrayRef(expr *ast.ArrayExpr) {
 	r.arrayRefs = append(r.arrayRefs, arrayRef{funcName, expr})
 	info := r.varTypes[funcName][name]
 	if info.typ == typeUnknown {
+		//fmt.Printf("TODO typeInfo 3 scope=%d expr=%s\n", scope, expr)
+		r.varTypes[funcName][name] = typeInfo{typeArray, nil, scope, 0, info.callName, 0}
+	}
+}
+
+func (r *resolver) recordArrayRef2(expr *ast.ArrayExpr, funcName string, scope ast.VarScope) {
+	//fmt.Printf("TODO recordArrayRef2 funcName=%s scope=%d\n", funcName, scope)
+	name := expr.Name
+	if scope == ast.ScopeSpecial {
+		panic(ast.PosErrorf(expr.Pos, "can't use scalar %q as array", name))
+	}
+	expr.Scope = scope
+	r.arrayRefs = append(r.arrayRefs, arrayRef{funcName, expr})
+	info := r.varTypes[funcName][name]
+	if info.typ == typeUnknown {
+		//fmt.Printf("TODO typeInfo 4 scope=%d\n", scope)
 		r.varTypes[funcName][name] = typeInfo{typeArray, nil, scope, 0, info.callName, 0}
 	}
 }
@@ -397,6 +522,25 @@ func (r *resolver) resolveVars(prog *ast.ResolvedProgram) {
 				paramType.typ = argType.typ
 				r.varTypes[function.Name][function.Params[i]] = paramType
 			}
+		}
+	}
+
+	// Make a second pass to resolve the type of x in length(x) calls, as it
+	// can be called with a scalar expression or an array variable.
+	//lcr := lengthCallResolver{resolver: r}
+	//ast.Walk(&lcr, &prog.Program)
+	for _, lvc := range r.lengthVarCalls {
+		varExpr := (*lvc.pArg).(*ast.VarExpr)
+		argType := r.varTypes[lvc.funcName][varExpr.Name]
+		if argType.typ == typeArray {
+			//fmt.Printf("TODO second pass length(%s) -- array\n", varExpr)
+			// Replace VarExpr with ArrayExpr
+			arrayExpr := ast.ArrayRef(varExpr.Name, varExpr.Pos)
+			*lvc.pArg = arrayExpr
+			r.recordArrayRef2(arrayExpr, lvc.funcName, lvc.scope)
+		} else {
+			//fmt.Printf("TODO second pass length(%s) -- scalar\n", varExpr)
+			r.recordVarRef2(varExpr, lvc.funcName, lvc.scope)
 		}
 	}
 

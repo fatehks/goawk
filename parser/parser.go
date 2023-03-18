@@ -862,6 +862,8 @@ func (p *parser) primary() ast.Expr {
 		if p.tok == LPAREN {
 			p.next()
 			if p.tok != RPAREN {
+				// In length(x), x can be a scalar or an array, but don't
+				// distinguish in the parser.
 				args = append(args, p.expr())
 			}
 			p.expect(RPAREN)

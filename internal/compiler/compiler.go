@@ -737,6 +737,18 @@ func (c *compiler) expr(expr ast.Expr) {
 			c.add(CallBuiltin, Opcode(op))
 			c.assign(target)
 			return
+		case lexer.F_LENGTH:
+			if len(e.Args) > 0 {
+				if arg, ok := e.Args[0].(*ast.ArrayExpr); ok {
+					c.add(CallLengthArray, Opcode(arg.Scope), opcodeInt(arg.Index))
+					return
+				}
+				c.expr(e.Args[0])
+				c.add(CallBuiltin, Opcode(BuiltinLengthArg))
+			} else {
+				c.add(CallBuiltin, Opcode(BuiltinLength))
+			}
+			return
 		}
 
 		for _, arg := range e.Args {
@@ -761,12 +773,6 @@ func (c *compiler) expr(expr ast.Expr) {
 			c.add(CallBuiltin, Opcode(BuiltinIndex))
 		case lexer.F_INT:
 			c.add(CallBuiltin, Opcode(BuiltinInt))
-		case lexer.F_LENGTH:
-			if len(e.Args) > 0 {
-				c.add(CallBuiltin, Opcode(BuiltinLengthArg))
-			} else {
-				c.add(CallBuiltin, Opcode(BuiltinLength))
-			}
 		case lexer.F_LOG:
 			c.add(CallBuiltin, Opcode(BuiltinLog))
 		case lexer.F_MATCH:
